@@ -1,63 +1,77 @@
 # User Payout Management System
 
-This repository contains a Python implementation and low-level design for an affiliate payout management system.
+This repository contains the low-level design and Python implementation for a user payout management system for affiliate sales.
 
-## Submission Checklist
+## Overview
 
-- Low-Level Design included in this README
-- Database schema with relationships included
-- Class design reflected in Python code
-- API/endpoints both designed and implemented
-- Edge cases and failure scenarios covered
-- Working Python implementation included
-- Unit tests included
-- Demo runner included
+The system supports the full payout lifecycle for affiliate sales:
+
+- every sale enters the system as `pending`
+- eligible pending sales receive a one-time advance payout of `10%`
+- an admin later reconciles each sale to `approved` or `rejected`
+- final settlement accounts for any advance already paid
+- users can withdraw from their available balance, but only once every 24 hours
+- failed, cancelled, or rejected withdrawals are credited back automatically
+
+The implementation is intentionally small and dependency-free so that the business logic remains easy to review.
+
+## Assumptions
+
+- All newly created sales must start in `pending` state.
+- Advance payout is credited exactly once per sale.
+- Reconciliation is a one-time operation per sale.
+- Negative wallet balances are allowed after a rejected sale if an advance had already been paid.
+- Withdrawable balance is updated immediately when a withdrawal is initiated.
+- If a payout gateway later marks that withdrawal as `failed`, `cancelled`, or `rejected`, the amount is restored to the wallet.
 
 ## 1. Problem Statement
 
-We need to manage affiliate sales and payouts with the following rules:
+The goal is to design a payout system that handles:
 
-- Every sale enters the system in `pending` state.
-- Pending sales are eligible for an `advance payout` equal to `10%` of earning.
-- The advance payout must be issued only once per sale, even if the advance payout job runs multiple times.
-- Later, an admin reconciles the sale and changes its status to `approved` or `rejected`.
-- Final payout must account for the advance already paid.
-- A user can initiate only one withdrawal every 24 hours.
-- If a withdrawal later becomes `failed`, `cancelled`, or `rejected`, the amount must be credited back.
+- sale ingestion
+- advance payouts on pending sales
+- final settlement after reconciliation
+- withdrawal restrictions
+- recovery of failed payouts
+
+The assignment also requires a clear database design, class design, APIs, edge-case handling, and a working implementation.
 
 ## 2. Requirements
 
 ### Functional Requirements
 
-- Ingest and store sales
-- Run advance payout job for eligible pending sales
-- Reconcile a sale exactly once
-- Maintain user withdrawable balance
-- Allow user withdrawals with a 24-hour cooldown
-- Recover failed withdrawals
-- Keep audit history of money movement
+- Store sales for each user and brand
+- Process advance payout for eligible pending sales
+- Prevent duplicate advance payout for the same sale
+- Reconcile a sale to `approved` or `rejected`
+- Calculate final settlement after reconciliation
+- Maintain a withdrawable balance for each user
+- Restrict withdrawals to one per 24 hours
+- Recover failed, cancelled, or rejected withdrawals
+- Maintain an auditable history of balance changes
 
 ### Non-Functional Requirements
 
 - Idempotent payout processing
-- Clear auditability
-- Simple and readable implementation
-- Extensible design for future database-backed persistence
+- Clear separation of responsibilities
+- Auditable balance changes
+- Easy local execution without external dependencies
+- Design that can be extended to a persistent database-backed implementation
 
 ## 3. Design Approach
 
-The design separates the system into four concepts:
+The design separates business state from money movement:
 
 - `Sale`
   Represents the affiliate earning event.
 - `Payout`
-  Represents a money movement event such as advance payout, final settlement, withdrawal, or recovery.
+  Represents a transfer-related event such as advance payout, final settlement, withdrawal, or recovery.
 - `UserWallet`
   Represents the user's current withdrawable balance.
 - `LedgerEntry`
-  Represents immutable balance history for auditability.
+  Represents an immutable audit record for wallet changes.
 
-This separation makes payout retries and failure handling safer than directly mutating a single balance table with no history.
+This separation makes retries, reconciliation, and payout failure recovery easier to reason about and easier to audit.
 
 ## 4. Entity Design
 
@@ -138,7 +152,7 @@ Fields:
 
 ## 6. Database Schema Design
 
-The implementation uses in-memory repositories, but this is the relational schema I would use in production.
+The current implementation uses in-memory repositories, but the following relational schema maps directly to a production setup.
 
 ### `sales`
 
@@ -198,8 +212,8 @@ Indexes:
 | `user_id` | `varchar` | indexed |
 | `sale_id` | `varchar null` | nullable |
 | `payout_id` | `varchar null` | nullable |
-| `amount` | `decimal(12,2)` | signed value |
-| `entry_type` | `varchar` | domain-specific event type |
+| `amount` | `decimal(12,2)` | signed amount |
+| `entry_type` | `varchar` | domain event type |
 | `note` | `varchar` | audit note |
 | `created_at` | `timestamp` | |
 
@@ -233,9 +247,8 @@ Indexes:
 ### A. Sale Creation
 
 1. Validate earning amount
-2. Force status to `pending`
-3. Create sale
-4. Ensure wallet exists
+2. Create sale in `pending` state
+3. Ensure the user's wallet exists
 
 ### B. Advance Payout Job
 
@@ -243,25 +256,27 @@ Indexes:
    - `status = pending`
    - `advance_paid = false`
 2. For each sale:
-   - compute `10%` advance
-   - create advance payout with `success`
-   - mark sale advance as paid
-   - credit wallet
-   - create ledger entry
+   - calculate `10%` of earning
+   - create an advance payout
+   - mark the sale as advance-paid
+   - credit the wallet
+   - write a ledger entry
+
+Idempotency is enforced using the `advance_paid` marker on each sale.
 
 ### C. Reconciliation
 
 Rules:
 
-- Sale can be reconciled only once
-- Allowed statuses are `approved` and `rejected`
+- A sale can be reconciled only once.
+- Only `approved` and `rejected` are valid reconciliation states.
 
 Computation:
 
 - If `approved`: `earning - advance_paid_amount`
 - If `rejected`: `-advance_paid_amount`
 
-Example from assignment:
+Example from the assignment:
 
 | Sale Status | Earning | Advance Paid | Final Adjustment |
 |---|---:|---:|---:|
@@ -269,37 +284,39 @@ Example from assignment:
 | approved | 40 | 4 | 36 |
 | approved | 40 | 4 | 36 |
 
-Total final payout effect: `68`
+Net final settlement after reconciliation: `68`
 
-Note:
-
-- In this implementation, the assignment's `Final Payout = 68` is represented as `final_settlement_total`.
-- If the earlier advance payouts have not yet been withdrawn/spent from the wallet, the wallet balance can be higher than `68` because it still includes the already-credited advance amounts.
+In the implementation, this value is exposed as `final_settlement_total`.  
+The wallet balance may be higher because advance payouts are already credited before reconciliation.
 
 ### D. Withdrawal
 
 1. Validate amount
 2. Validate idempotency key
-3. Check last withdrawal timestamp
-4. Check sufficient withdrawable balance
+3. Enforce the 24-hour withdrawal rule
+4. Check available balance
 5. Create withdrawal payout with `initiated`
 6. Deduct balance immediately
-7. Create ledger entry
+7. Write a ledger entry
 
-### E. Failed Withdrawal Recovery
+### E. Failed Payout Recovery
 
-When provider later reports `failed`, `cancelled`, or `rejected`:
+If a withdrawal later becomes `failed`, `cancelled`, or `rejected`:
 
-1. Update withdrawal payout status
-2. Credit amount back to wallet
-3. Create recovery payout
-4. Write ledger entry
+1. update the withdrawal status
+2. credit the amount back to the wallet
+3. create a recovery payout
+4. write a recovery ledger entry
+
+Duplicate callbacks with the same terminal state are treated idempotently.
 
 ## 9. API Design
 
-The repo includes a lightweight HTTP API built with Python's standard library in `app/api.py`.
+A lightweight HTTP API is provided using Python's standard library.
 
 ### `POST /sales`
+
+Creates a pending sale.
 
 ```json
 {
@@ -315,6 +332,8 @@ Runs the advance payout batch job.
 
 ### `POST /sales/{sale_id}/reconcile`
 
+Reconciles a sale.
+
 ```json
 {
   "status": "approved"
@@ -323,13 +342,14 @@ Runs the advance payout batch job.
 
 ### `GET /users/{user_id}/wallet`
 
-Returns wallet, sales, payouts, and ledger data.
-It also returns:
+Returns wallet state, sales, payouts, ledger entries, and aggregates such as:
 
 - `advance_paid_total`
 - `final_settlement_total`
 
 ### `POST /withdrawals`
+
+Initiates a withdrawal.
 
 ```json
 {
@@ -341,6 +361,8 @@ It also returns:
 
 ### `POST /withdrawals/{payout_id}/status`
 
+Updates the status of a withdrawal.
+
 ```json
 {
   "status": "failed"
@@ -349,44 +371,49 @@ It also returns:
 
 ### `GET /health`
 
-Returns a simple health response.
+Simple health-check endpoint.
 
 ## 10. Edge Cases and Failure Handling
 
-- Advance payout job runs multiple times and already-paid sales are skipped
-- Same sale cannot be reconciled twice
-- Duplicate withdrawal request is blocked by `idempotency_key`
-- Withdrawal within 24 hours is rejected
-- Failed/cancelled/rejected withdrawal restores balance
-- Duplicate status update with the same terminal state is treated idempotently
-- Conflicting second status update is blocked because only `initiated` withdrawals can transition
-- Rejected sales can push wallet balance negative due to clawback
+- Advance payout job runs multiple times: already processed sales are skipped.
+- Same sale reconciled twice: blocked using the `finalized` flag.
+- Duplicate withdrawal request: blocked using `idempotency_key`.
+- Withdrawal within 24 hours: rejected.
+- Failed, cancelled, or rejected withdrawal: amount is restored.
+- Duplicate callback with same terminal state: treated idempotently.
+- Conflicting second callback after terminal state: rejected.
+- Rejected sale after advance payout: handled as a clawback adjustment.
 
-## 11. Trade-offs and Decisions
+## 11. Trade-offs
 
-### Chosen
+### Chosen Approach
 
-- `Python` for readable domain logic
-- `In-memory repositories` for simple review and execution
-- `Negative wallet balances allowed` for direct clawback modeling
+- `Python`
+  Keeps the domain logic concise and easy to read.
+- `In-memory repositories`
+  Keeps setup simple and makes the business rules the main focus.
+- `Negative wallet balances allowed`
+  Keeps rejected-sale clawback handling straightforward.
 
 ### Alternatives
 
-- `SQLite/PostgreSQL` for persistence
-- `Separate debt table` if negative balances are not allowed
+- `SQLite` or `PostgreSQL`
+  Better for persistence and transactional safety.
+- separate debt tracking instead of negative balance
+  Useful if the product disallows negative wallet balances.
 
 ## 12. Testing Strategy
 
-Current tests cover:
+The test suite covers:
 
 - advance payout idempotency
-- assignment reconciliation example
+- the assignment reconciliation example
 - explicit final settlement total for the assignment example
 - 24-hour withdrawal restriction
 - failed withdrawal recovery
 - duplicate reconciliation prevention
 - duplicate withdrawal idempotency key rejection
-- duplicate payout status update prevention
+- duplicate payout status update handling
 - duplicate failed callback idempotency
 - JSON-safe summary serialization
 
@@ -410,7 +437,7 @@ main.py
 README.md
 ```
 
-## 14. How to Run
+## 14. Running the Project
 
 ### Run the API server
 
@@ -418,7 +445,7 @@ README.md
 python main.py
 ```
 
-Server runs at:
+Server address:
 
 ```text
 http://127.0.0.1:8000
@@ -438,13 +465,13 @@ python -m app.demo
 
 ## 15. Python Setup
 
-This project uses only the Python standard library, so setup is straightforward.
+This project uses only the Python standard library, so no additional package installation is required.
 
 ### Windows Setup
 
 1. Install Python 3.11 or newer from `python.org`.
-2. During installation, enable `Add python.exe to PATH`.
-3. After installation, open a new terminal and verify:
+2. Enable `Add python.exe to PATH` during installation.
+3. Open a new terminal and verify:
 
 ```powershell
 python --version
@@ -473,9 +500,9 @@ python -m unittest discover -s tests -v
 
 ### Common Windows Fixes
 
-- If `python` opens the Microsoft Store, disable the App Execution Alias for Python in Windows settings.
-- If terminal still cannot find Python, reopen the terminal after installation.
-- If both `python` and `py` fail, reinstall Python and ensure PATH is enabled during setup.
+- If `python` opens the Microsoft Store, disable the Python App Execution Alias in Windows settings.
+- If the terminal still cannot find Python, reopen the terminal after installation.
+- If both `python` and `py` fail, reinstall Python and ensure PATH was enabled.
 
 ## 16. Sample API Flow
 
@@ -487,7 +514,7 @@ curl -X POST http://127.0.0.1:8000/sales ^
   -d "{\"userId\":\"john_doe\",\"brand\":\"brand_1\",\"earning\":40}"
 ```
 
-Repeat it three times for the assignment example.
+Repeat the request three times for the sample scenario.
 
 ### 2. Run advance payout job
 
@@ -515,17 +542,18 @@ curl -X POST http://127.0.0.1:8000/sales/sale_3/reconcile ^
   -d "{\"status\":\"approved\"}"
 ```
 
-### 4. Fetch final wallet summary
+### 4. Fetch user summary
 
 ```bash
 curl http://127.0.0.1:8000/users/john_doe/wallet
 ```
 
-## 17. Production Improvements
+## 17. Possible Production Improvements
 
-- Replace in-memory repositories with PostgreSQL/MySQL repositories
-- Add transactional guarantees for payout jobs
-- Add payout provider abstraction and webhook verification
-- Add admin/user authentication and authorization
-- Add payout status transition history
-- Add retry queue for external transfer failures
+- replace in-memory repositories with database-backed repositories
+- wrap payout state changes in transactions
+- add a payout provider abstraction
+- verify callback authenticity
+- add authentication and authorization
+- maintain payout status transition history
+- add retry handling around external payout operations
